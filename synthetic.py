@@ -2,7 +2,6 @@
 from my_core import sample_masks, design_matrix, ols_fit, realized_cest, certified_floor, certified_set, log_pk_over_delta
 import numpy as np
 import math
-from itertools import combinations
 
 #%%
 def sample_degree1_problem(N, beta_true, intercept = 0.0, sigma_obs = 0.0, rng = None):
@@ -17,62 +16,6 @@ def sample_degree1_problem(N, beta_true, intercept = 0.0, sigma_obs = 0.0, rng =
     y = intercept + X @ beta_true + query_noise
 
     return Z, y
-
-#%%
-#Test thử với sigma_obs = 0, ngân sách lớn thậm chí thừa
-beta_true = [0.40, -0.30, 0.02, 0.00, 0.15, -0.01]
-d = len(beta_true)
-intercept = 0.70
-N = 13
-sigma_obs = 0
-
-rng_clean = np.random.default_rng(42)
-Z_clean, y_clean = sample_degree1_problem(N, beta_true, intercept, sigma_obs, rng_clean)
-
-beta_hat, intercept_hat, _ = ols_fit(Z_clean, y_clean, 1)
-
-full_error = np.max(
-        np.abs(np.concatenate(([intercept_hat], beta_hat))
-               - np.concatenate(([intercept], beta_true)))
-    )
-
-print("=== Exact recovery ===")
-print("intercept true:", intercept)
-print("intercept hat :", intercept_hat)
-print("beta true     :", beta_true)
-print("beta hat      :", beta_hat)
-print("max error     :", full_error)
-
-# %% sigma_obs > 0
-sigma_obs = 0.05
-rng_noisy = np.random.default_rng(123)
-
-Z, y =sample_degree1_problem(N=N, beta_true=beta_true, intercept=intercept, sigma_obs= sigma_obs, rng=rng_noisy)
-
-beta_hat2, intercept_hat2, _ = ols_fit(Z, y, K=1)
-
-c_est = realized_cest(Z, K=1)
-
-floor = certified_floor(c_est=c_est, sigma_obs=sigma_obs, m_ub=0.0, B_pop_ub=0.0, d=d, N=N, K=1)
-
-certified = certified_set(beta_hat2, floor)
-
-print("\n=== Noisy certificate smoke test ===")
-print("C_est:", c_est)
-print("floor:", floor)
-print()
-print(" idx | beta_true | beta_hat | certified | sign_hat | sign_true")
-
-for i in range(d):
-    print(
-        f"{i:>4} | "
-        f"{beta_true[i]:>9.4f} | "
-        f"{beta_hat2[i]:>8.4f} | "
-        f"{str(bool(certified[i])):>9} | "
-        f"{np.sign(beta_hat2[i]):>8.0f} | "
-        f"{np.sign(beta_true[i]):>9.0f}"
-    )
-
 # %%
 """
 tạm thời đang để intercept = 0
@@ -157,14 +100,13 @@ def make_synthetic_function(
     return beta_true, active_set, sample_fn, resid_fn, g_fn
 
 #%% eta_N
-def emperical_leakage(Z, r):
+def empirical_leakage(Z, r):
     Z = np.asarray(Z, dtype=float)
     r = np.asarray(r, dtype=float)
     N = Z.shape[0]
     X_effect = design_matrix(Z, K = 1, intercept=False)
-    X_aug = design_matrix(Z, K=1, intercept= True)
 
-    pre_eta = (1/N) * (X_aug.T @ r)
+    pre_eta = (1/N) * (X_effect.T @ r)
 
     eta = float(np.max(np.abs(pre_eta)))
     return eta
@@ -194,7 +136,7 @@ def test_empirical_leakage():
     )
 
     r_cube = resid_fn(Z_cube)
-    eta_cube = emperical_leakage(Z_cube, r_cube)
+    eta_cube = empirical_leakage(Z_cube, r_cube)
 
     print("=== Full cube ===")
     print("N:", len(Z_cube))              # 64
@@ -214,7 +156,7 @@ def test_empirical_leakage():
             Z = sample_masks(N, d, rng)
             r = resid_fn(Z)
 
-            eta_values.append(emperical_leakage(Z, r))
+            eta_values.append(empirical_leakage(Z, r))
 
         print(
             f"{N:>3} | "
@@ -222,6 +164,31 @@ def test_empirical_leakage():
             f"{np.std(eta_values):>9.6f}"
         )
 
+
+#%%
+"""
+Thêm hai helper nhỏ
+"""
+def coefficient_of_variation(values):
+    values = np.asarray(values, dtype=float)
+
+    if len(values) < 2 or np.isclose(values.mean(), 0.0):
+        return float("nan")
+
+    return float(values.std() / abs(values.mean()))
+
+def bernstein_diagnostics(m_resid, B_sample, d, N, K=1):
+    L = log_pk_over_delta(d, K, delta=None, split=3)
+
+    sub_gaussian = math.sqrt(2.0 * m_resid * L / N)
+    sub_exponential = (2.0 / 3.0) * B_sample * L / N
+
+    if m_resid <= 0.0:
+        N_dom = float("inf")
+    else:
+        N_dom = (2.0 * B_sample**2 / (9.0 * m_resid)) * L
+
+    return sub_gaussian, sub_exponential, N_dom
 # %% Ước lượng Cm
 def calibrate_leakage(
     d=30,
@@ -229,54 +196,100 @@ def calibrate_leakage(
     n_trials=40,
     m_grid=(0.005, 0.02, 0.05, 0.1, 0.2),
     N_grid=(250, 500, 1000, 2000, 4000),
+    N_freeze=2000,
 ):
-
     K = 1
-    L = log_pk_over_delta(d, K, delta = None, split=3)
+    L = log_pk_over_delta(d, K, delta=None, split=3)
+
+    ratios_all = []
+    ratios_large = []
     results = []
+    not_dominated = 0
 
     print("=== Leakage calibration ===")
     print(f"d={d}, p1={d + 1}, L={L:.6f}")
-    print("m_resid |    N | mean_eta | predicted_scale | C_m_emp")
+    print(
+        "m_resid |    N | mean_eta | predicted | C_m_emp | "
+        "subexp | N_dom | dom?"
+    )
+
     for m_resid in m_grid:
         for N in N_grid:
             eta_values = []
+            B_samples = []
 
             for trial in range(n_trials):
-                _, _, _, resid_fn, _ = make_synthetic_function(d, n_active, beta_active = 0.0, m_resid=m_resid, seed=7 * trial + N)
-                rng = np.random.default_rng(
-                    123 + trial + N
+                _, _, _, resid_fn, _ = make_synthetic_function(
+                    d=d,
+                    n_active=n_active,
+                    beta_active=0.0,
+                    m_resid=m_resid,
+                    seed=7 * trial + N,
                 )
 
+                rng = np.random.default_rng(123 + trial + N)
                 Z = sample_masks(N, d, rng)
                 r = resid_fn(Z)
-                eta_values.append(
-                    emperical_leakage(Z, r)
-                )
+
+                eta_values.append(empirical_leakage(Z, r))
+                B_samples.append(float(np.max(np.abs(r))))
+
             mean_eta = float(np.mean(eta_values))
             std_eta = float(np.std(eta_values))
+            B_sample = float(np.mean(B_samples))
+
             predicted_scale = math.sqrt(m_resid * L / N)
             c_m_emp = mean_eta / predicted_scale
 
-            row = {
+            sub_g, sub_e, N_dom = bernstein_diagnostics(
+                m_resid, B_sample, d, N, K
+            )
+            dominated = N >= N_dom
+
+            ratios_all.append(c_m_emp)
+
+            if N >= N_freeze:
+                ratios_large.append(c_m_emp)
+
+            if not dominated:
+                not_dominated += 1
+
+            results.append({
                 "m_resid": m_resid,
                 "N": N,
                 "mean_eta": mean_eta,
                 "std_eta": std_eta,
+                "B_sample": B_sample,
                 "predicted_scale": predicted_scale,
                 "c_m_emp": c_m_emp,
-            }
-
-            results.append(row)
+                "sub_gaussian": sub_g,
+                "sub_exponential": sub_e,
+                "N_dom": N_dom,
+                "dominated": dominated,
+            })
 
             print(
-                f"{m_resid:>7.3f} | "
-                f"{N:>4d} | "
-                f"{mean_eta:>8.6f} | "
-                f"{predicted_scale:>15.6f} | "
-                f"{c_m_emp:>7.3f}"
+                f"{m_resid:>7.3f} | {N:>4d} | "
+                f"{mean_eta:>8.6f} | {predicted_scale:>9.6f} | "
+                f"{c_m_emp:>7.3f} | {sub_e:>6.4f} | "
+                f"{N_dom:>5.0f} | {'yes' if dominated else 'NO'}"
             )
-    return results
+
+    C_m_all = float(np.mean(ratios_all))
+    C_m_frozen = float(np.mean(ratios_large))
+
+    print()
+    print(f"C_m all-N               = {C_m_all:.3f}")
+    print(
+        f"C_m N >= {N_freeze} (FROZEN) = {C_m_frozen:.3f}; "
+        f"CoV = {coefficient_of_variation(ratios_large):.3f}"
+    )
+    print(
+        f"Dominated cells: "
+        f"{len(results) - not_dominated}/{len(results)}"
+    )
+
+    return C_m_frozen, results
 
 if __name__ == "__main__":
     rows = calibrate_leakage()
