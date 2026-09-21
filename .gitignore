@@ -1,0 +1,17 @@
+# Local Python environments and generated artifacts
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Scratch/output folders
+tmp/
+
+# The paper stays local; its source code is represented by the implementation files.
+*.pdf
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
