@@ -290,7 +290,133 @@ def calibrate_leakage(
     )
 
     return C_m_frozen, results
-
-if __name__ == "__main__":
-    rows = calibrate_leakage()
 # %%
+"""
+Forward collapse
+biết N, sigma_obs, m
+→ tính planning floor trước khi sinh Z
+→ đặt beta = x * planning floor
+→ sinh nhiều Z độc lập
+→ fit OLS
+→ xem SDR có collapse không
+"""
+C_m = 0.799 #Lấy từ thí nghiệm trước
+
+def sigma_eff(sigma_obs, m_resid, Cm):
+    return sigma_obs + Cm * math.sqrt(m_resid)
+
+def planning_floor(s_eff, d, N, K = 1):
+    L = log_pk_over_delta(d, K, delta=None, split=3)
+    return s_eff * math.sqrt(2.0 * L/N)
+
+def regime_grid():
+    return [
+        dict(name="noise-lo",    N=500,  m=0.00, sigma_obs=0.05),
+        dict(name="noise-hi",    N=2000, m=0.00, sigma_obs=0.05),
+        dict(name="mismatch",    N=1000, m=0.10, sigma_obs=0.05),
+        dict(name="mixed-noisy", N=1000, m=0.10, sigma_obs=0.20),
+        dict(name="mixed-big",   N=4000, m=0.25, sigma_obs=0.10),
+    ]
+
+def find_x_half(x_grid, sdr_values):
+    for k in range(1, len(x_grid)):
+        prev_sdr = sdr_values[k - 1]
+        curr_sdr = sdr_values[k]
+
+        if prev_sdr < 0.5 <= curr_sdr:
+            x_lo = x_grid[k - 1]
+            x_hi = x_grid[k]
+
+            return x_lo + (0.5 - prev_sdr) * (x_hi - x_lo) / (
+                curr_sdr - prev_sdr
+            )
+
+    return float("nan")
+
+
+"""
+Kiểm tra xem có chọn đúng Cm không ? bằng cách kiểm tra phân phối của U
+"""
+def u_audit(C_m, d = 30, n_active = 4, n_trials = 100):
+    audits = {}
+    print("\n=== U audit ===")
+    print(
+        "regime       | s_plan | mean(U) | std(U) | "
+        "q90(|U|) | median(T) | q90(T)"
+    )
+    for regime_index, regime in enumerate(regime_grid()):
+        N = regime["N"]
+        m_resid = regime["m"]
+        sigma_obs = regime["sigma_obs"]
+
+        s_eff = sigma_eff(sigma_obs, m_resid, C_m)
+        s_plan = planning_floor(s_eff, d, N, K=1)
+
+        U_all = []
+        V_all = []
+        T_all = []
+
+        for trial in range(n_trials):
+            beta_true, active_set, sample_fn, _, _ = (
+                make_synthetic_function(
+                    d=d,
+                    n_active=n_active,
+                    beta_active=s_plan,
+                    m_resid=m_resid,
+                    seed=10_000 * regime_index + trial,
+                )
+            )
+            rng = np.random.default_rng(
+                100_000 + 10_000 * regime_index + trial
+            )
+
+            Z, y = sample_fn(
+                N=N,
+                sigma_obs=sigma_obs,
+                rng=rng,
+            )
+
+            beta_hat, _, _ = ols_fit(Z, y, K=1)
+
+            active_idx = np.array(sorted(active_set), dtype=int)
+
+            # U_i = (beta_hat_i - beta_true_i) / s_plan
+            U = (
+                beta_hat[active_idx] - beta_true[active_idx]
+            ) / s_plan
+
+            # V_i = sign(beta_true_i) * U_i
+            V = np.sign(beta_true[active_idx]) * U
+
+            # Trial này cần x > T để toàn bộ active coords đúng dấu.
+            T = -np.min(V)
+
+            U_all.extend(U.tolist())
+            V_all.extend(V.tolist())
+            T_all.append(float(T))
+
+        U_all = np.asarray(U_all, dtype=float)
+        V_all = np.asarray(V_all, dtype=float)
+        T_all = np.asarray(T_all, dtype=float)
+
+        audits[regime["name"]] = {
+            "U": U_all,
+            "V": V_all,
+            "T": T_all,
+            "s_plan": s_plan,
+            "N": N,
+            "m_resid": m_resid,
+            "sigma_obs": sigma_obs,
+        }
+
+        print(
+            f"{regime['name']:>12} | "
+            f"{s_plan:>6.4f} | "
+            f"{np.mean(U_all):>7.3f} | "
+            f"{np.std(U_all):>6.3f} | "
+            f"{np.quantile(np.abs(U_all), 0.90):>8.3f} | "
+            f"{np.median(T_all):>9.3f} | "
+            f"{np.quantile(T_all, 0.90):>6.3f}"
+        )
+
+    return audits
