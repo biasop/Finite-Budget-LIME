@@ -2,6 +2,7 @@
 from my_core import sample_masks, design_matrix, ols_fit, realized_cest, certified_floor, certified_set, log_pk_over_delta
 import numpy as np
 import math
+import matplotlib.pyplot as plt
 
 #%%
 def sample_degree1_problem(N, beta_true, intercept = 0.0, sigma_obs = 0.0, rng = None):
@@ -420,3 +421,100 @@ def u_audit(C_m, d = 30, n_active = 4, n_trials = 100):
         )
 
     return audits
+
+"""
+"""
+def find_xq(x_grid, sdr, q):
+    for k in range(1, len(x_grid)):
+        y0, y1 = sdr[k - 1], sdr[k]
+
+        if y0 < q <= y1:
+            x0, x1 = x_grid[k - 1], x_grid[k]
+
+            if y1 == y0:
+                return x1
+
+            return x0 + (q - y0) * (x1 - x0) / (y1 - y0)
+
+    return float("nan")
+
+"""
+Thí nghiệm forward collapse
+"""
+def run_forward_collapse(
+    C_m=0.799,
+    d=30,
+    n_active=4,
+    n_trials=100,
+    x_grid=None,
+):
+    if x_grid is None:
+        x_grid = np.geomspace(0.05, 4.0, 24)
+    results = {}
+
+    for regime_index, regime in enumerate(regime_grid()):
+        N = regime["N"]
+        m_resid = regime["m"]
+        sigma_obs = regime["sigma_obs"]
+
+        s_eff = sigma_eff(sigma_obs=sigma_obs, m_resid=m_resid, Cm=C_m)
+
+        splan = planning_floor(s_eff=s_eff, d=d, N=N, K = 1)
+
+        sdr = []
+
+        for x in x_grid:
+            success_count = 0
+            for trial in range(n_trials):
+                problem_seed = (
+                    1_000_000
+                    + 10_000 * regime_index
+                    + trial
+                )
+
+                query_seed = (
+                    2_000_000
+                    + 10_000 * regime_index
+                    + trial
+                )
+
+                beta_true, active_set, sample_fn, _, _ = (
+                    make_synthetic_function(
+                        d=d,
+                        n_active=n_active,
+                        beta_active=x * splan,
+                        m_resid=m_resid,
+                        seed=problem_seed,
+                    )
+                )
+
+                rng = np.random.default_rng(query_seed)
+
+                Z, y = sample_fn(N=N, sigma_obs=sigma_obs, rng=rng)
+
+                beta_hat, _, _ = ols_fit(Z, y, K=1)
+
+                active_idx = np.array(
+                    sorted(active_set),
+                    dtype=int,
+                )
+
+                recovered = np.all(
+                    np.sign(beta_hat[active_idx])
+                    == np.sign(beta_true[active_idx])
+                )
+
+                success_count += int(recovered)
+
+            sdr.append(success_count / n_trials)
+
+        sdr = np.asanyarray(sdr)
+        results[regime["name"]] = {
+            "x_grid": x_grid.copy(),
+            "sdr": sdr,
+            "s_plan": splan,
+            "x_half": find_xq(x_grid, sdr, 0.50),
+        }
+
+    
+
