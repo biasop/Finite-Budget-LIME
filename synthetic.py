@@ -301,8 +301,6 @@ biết N, sigma_obs, m
 → fit OLS
 → xem SDR có collapse không
 """
-C_m = 0.799 #Lấy từ thí nghiệm trước
-
 def sigma_eff(sigma_obs, m_resid, Cm):
     return sigma_obs + Cm * math.sqrt(m_resid)
 
@@ -422,59 +420,66 @@ def u_audit(C_m, d = 30, n_active = 4, n_trials = 100):
 
     return audits
 
-"""
-"""
-def find_xq(x_grid, sdr, q):
-    for k in range(1, len(x_grid)):
-        y0, y1 = sdr[k - 1], sdr[k]
-
-        if y0 < q <= y1:
-            x0, x1 = x_grid[k - 1], x_grid[k]
-
-            if y1 == y0:
-                return x1
-
-            return x0 + (q - y0) * (x1 - x0) / (y1 - y0)
-
-    return float("nan")
-
-"""
-Thí nghiệm forward collapse
-"""
 def run_forward_collapse(
     C_m=0.799,
     d=30,
     n_active=4,
-    n_trials=100,
+    n_trials=60,
     x_grid=None,
 ):
     if x_grid is None:
+        # Giống thí nghiệm mẫu
         x_grid = np.geomspace(0.05, 4.0, 24)
+
     results = {}
+    crossings = []
+
+    print("\n=== Forward collapse ===")
+    print(
+        "regime       |     N |     m | sigma | "
+        "s_plan | x_0.5 | SDR@x~1"
+    )
+    print("-" * 74)
 
     for regime_index, regime in enumerate(regime_grid()):
+        name = regime["name"]
         N = regime["N"]
         m_resid = regime["m"]
         sigma_obs = regime["sigma_obs"]
 
-        s_eff = sigma_eff(sigma_obs=sigma_obs, m_resid=m_resid, Cm=C_m)
+        # Planning scale dùng C_m đã freeze
+        s_eff = sigma_eff(
+            sigma_obs=sigma_obs,
+            m_resid=m_resid,
+            Cm=C_m,
+        )
 
-        splan = planning_floor(s_eff=s_eff, d=d, N=N, K = 1)
+        s_plan = planning_floor(
+            s_eff=s_eff,
+            d=d,
+            N=N,
+            K=1,
+        )
 
-        sdr = []
+        sdr_values = []
 
-        for x in x_grid:
+        # Quét các mức tín hiệu beta = x * s_plan
+        for x_index, x in enumerate(x_grid):
             success_count = 0
+
             for trial in range(n_trials):
+                # Seed phụ thuộc regime, x và trial
                 problem_seed = (
                     1_000_000
-                    + 10_000 * regime_index
+                    + 100_000 * regime_index
+                    + 1_000 * x_index
                     + trial
                 )
 
                 query_seed = (
                     2_000_000
-                    + 10_000 * regime_index
+                    + 100_000 * regime_index
+                    + 1_000 * x_index
                     + trial
                 )
 
@@ -482,7 +487,7 @@ def run_forward_collapse(
                     make_synthetic_function(
                         d=d,
                         n_active=n_active,
-                        beta_active=x * splan,
+                        beta_active=x * s_plan,
                         m_resid=m_resid,
                         seed=problem_seed,
                     )
@@ -490,11 +495,19 @@ def run_forward_collapse(
 
                 rng = np.random.default_rng(query_seed)
 
-                Z, y = sample_fn(N=N, sigma_obs=sigma_obs, rng=rng)
+                Z, y = sample_fn(
+                    N=N,
+                    sigma_obs=sigma_obs,
+                    rng=rng,
+                )
 
-                beta_hat, _, _ = ols_fit(Z, y, K=1)
+                beta_hat, _, _ = ols_fit(
+                    Z,
+                    y,
+                    K=1,
+                )
 
-                active_idx = np.array(
+                active_idx = np.asarray(
                     sorted(active_set),
                     dtype=int,
                 )
@@ -506,15 +519,144 @@ def run_forward_collapse(
 
                 success_count += int(recovered)
 
-            sdr.append(success_count / n_trials)
+            sdr = success_count / n_trials
+            sdr_values.append(sdr)
 
-        sdr = np.asanyarray(sdr)
-        results[regime["name"]] = {
+        sdr_values = np.asarray(
+            sdr_values,
+            dtype=float,
+        )
+
+        # Điểm SDR cắt mức 0.5
+        x_half = find_x_half(
+            x_grid,
+            sdr_values,
+        )
+
+        # SDR tại điểm grid gần x=1 nhất
+        index_at_one = int(
+            np.argmin(np.abs(x_grid - 1.0))
+        )
+        sdr_at_one = float(
+            sdr_values[index_at_one]
+        )
+
+        crossings.append(x_half)
+
+        results[name] = {
+            "N": N,
+            "m_resid": m_resid,
+            "sigma_obs": sigma_obs,
+            "s_eff": s_eff,
+            "s_plan": s_plan,
             "x_grid": x_grid.copy(),
-            "sdr": sdr,
-            "s_plan": splan,
-            "x_half": find_xq(x_grid, sdr, 0.50),
+            "sdr": sdr_values,
+            "x_half": x_half,
+            "sdr_at_one": sdr_at_one,
         }
+
+        print(
+            f"{name:>12} | "
+            f"{N:>5d} | "
+            f"{m_resid:>5.2f} | "
+            f"{sigma_obs:>5.2f} | "
+            f"{s_plan:>6.4f} | "
+            f"{x_half:>5.3f} | "
+            f"{sdr_at_one:>7.3f}"
+        )
+
+    # Độ gần nhau của x_0.5 giữa các regime
+    valid_crossings = np.asarray(
+        [
+            value
+            for value in crossings
+            if np.isfinite(value)
+        ],
+        dtype=float,
+    )
+
+    if len(valid_crossings) == 0:
+        shared_x_half = float("nan")
+        collapse_cov = float("nan")
+    else:
+        shared_x_half = float(
+            np.mean(valid_crossings)
+        )
+        collapse_cov = coefficient_of_variation(
+            valid_crossings
+        )
+
+    print("\n=== Collapse summary ===")
+    print(f"shared x_0.5 : {shared_x_half:.3f}")
+    print(f"CoV(x_0.5)   : {collapse_cov:.3f}")
+
+    all_regimes_crossed = (
+        len(valid_crossings) == len(results)
+    )
+
+    if not all_regimes_crossed:
+        verdict = "NO CROSSING"
+    elif np.isfinite(collapse_cov):
+        verdict = (
+            "PASS"
+            if collapse_cov < 0.25
+            else "CHECK"
+        )
+    else:
+        verdict = "CHECK"
+
+    print(f"Verdict       : {verdict}")
+
+    # Vẽ các đường SDR
+    plt.figure(figsize=(10, 6))
+
+    for name, result in results.items():
+        plt.plot(
+            result["x_grid"],
+            result["sdr"],
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            label=name,
+        )
+
+    plt.axhline(
+        0.5,
+        color="black",
+        linestyle="--",
+        linewidth=1,
+        label="SDR = 0.5",
+    )
+
+    if np.isfinite(shared_x_half):
+        plt.axvline(
+            shared_x_half,
+            color="gray",
+            linestyle=":",
+            linewidth=1,
+            label=f"shared x_0.5 ~ {shared_x_half:.3f}",
+        )
+
+    plt.xscale("log")
+    plt.xlabel(
+        r"$x=|\beta_{\min}|/s_{\mathrm{plan}}$"
+    )
+    plt.ylabel(
+        "Signed-detection rate"
+    )
+    plt.title(
+        "Forward collapse across regimes"
+    )
+    plt.ylim(-0.02, 1.02)
+    plt.grid(
+        alpha=0.3,
+        which="both",
+    )
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return results, shared_x_half, collapse_cov
 
     
 
