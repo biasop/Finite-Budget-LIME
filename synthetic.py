@@ -335,6 +335,8 @@ def find_x_half(x_grid, sdr_values):
 
 """
 Kiểm tra xem có chọn đúng Cm không ? bằng cách kiểm tra phân phối của U
+Nếu splan tốt thì phân phối của U sẽ gần như là như nhau
+Nếu phân phối U là như nhau -> SDR(x) sẽ giống nhau -> x0.5 sẽ như nhau
 """
 def u_audit(C_m, d = 30, n_active = 4, n_trials = 100):
     audits = {}
@@ -658,5 +660,196 @@ def run_forward_collapse(
 
     return results, shared_x_half, collapse_cov
 
-    
+"""
+Thí nghiệm C_budget
+Đặt m = 0
+-> sigma_eff =  sigma_obs
+sigma_obs = 1.0
+gammas = [0.20, 0.14, 0.10, 0.07] với gamma bằng beta / sigma_obs
+-> tạo beta = gamma.sigma_obs
 
+Trong backward:
+- \(\beta\) được đặt trước;
+- tăng dần \(N\);
+- \(N\) tăng làm:\[
+  s_{\text{plan}}(N)\propto\frac{1}{\sqrt N}
+  \]giảm xuống;
+- do đó:\[
+  x(N)=\frac{\beta}{s_{\text{plan}}(N)}
+  \]tăng lên;
+- tìm \(N\) đầu tiên đạt 90% certification.
+Tại ngân sách đó:
+\[
+\frac{\beta}{s_{\text{plan}}(N_{90})}
+=
+C_{\text{budget}}.
+\]
+
+\(C_{\text{budget}}\) chính là mức \(x\) cần đạt cho mục tiêu planning nghiêm ngặt hơn.
+"""
+
+def backward_budget(
+    d=30,
+    n_active=4,
+    sigma_obs=1.0,
+    n_trials=30,
+):
+    K = 1
+    pK = d + 1  # K=1, có d hệ số main effect + intercept
+    L = log_pk_over_delta(d, K, delta=None, split=3)
+    z_fw = math.sqrt(2.0 * L)
+
+    gammas = [0.20, 0.14, 0.10, 0.07]
+    N_grid = np.unique(
+        np.round(
+            np.geomspace(2 * pK, 60_000, 48)
+        ).astype(int)
+    )
+
+    results = []
+    implied_resolution = []
+
+    print("\n=== Backward budget ===")
+    print(
+        "gamma | beta  | N@90% | pred(C=1) | "
+        "implied C | regime"
+    )
+
+    for gamma in gammas:
+        beta = gamma * sigma_obs
+        N_90 = None
+
+        for N in N_grid:
+            success_count = 0
+
+            for trial in range(n_trials):
+                beta_true, active_set, sample_fn, _, _ = (
+                    make_synthetic_function(
+                        d=d,
+                        n_active=n_active,
+                        beta_active=beta,
+                        m_resid=0.0,
+                        seed=31 * trial + N + int(gamma * 1000),
+                    )
+                )
+
+                rng = np.random.default_rng(
+                    13 * trial + N
+                )
+                Z, y = sample_fn(
+                    N=N,
+                    sigma_obs=sigma_obs,
+                    rng=rng,
+                )
+
+                beta_hat, intercept_hat, diag_ginv = (
+                    ols_fit(Z, y, K=K)
+                )
+
+                # Residual của mô hình OLS vừa fit
+                X_effect = design_matrix(
+                    Z, K=K, intercept=False
+                )
+                y_hat = intercept_hat + X_effect @ beta_hat
+                residual = y - y_hat
+
+                dof = max(N - pK, 1)
+                sigma_hat = max(
+                    math.sqrt(
+                        float(residual @ residual) / dof
+                    ),
+                    1e-9,
+                )
+
+                active_idx = np.asarray(
+                    sorted(active_set),
+                    dtype=int,
+                )
+
+                se_active = sigma_hat * np.sqrt(
+                    diag_ginv[active_idx] / N
+                )
+
+                signs_correct = (
+                    np.sign(beta_hat[active_idx])
+                    == np.sign(beta_true[active_idx])
+                )
+
+                above_threshold = (
+                    np.abs(beta_hat[active_idx])
+                    > z_fw * se_active
+                )
+
+                # Cả 4 hệ số active đều phải đạt cả hai điều kiện
+                success = np.all(
+                    signs_correct & above_threshold
+                )
+                success_count += int(success)
+
+            detection_rate = success_count / n_trials
+
+            if detection_rate >= 0.90:
+                N_90 = int(N)
+                break
+
+        pred_C1 = (
+            2.0 * sigma_obs**2 * L / beta**2
+        )
+
+        if N_90 is None:
+            implied_C = float("nan")
+            regime_type = "NO CROSSING"
+        else:
+            implied_C = math.sqrt(
+                N_90 * beta**2
+                / (2.0 * sigma_obs**2 * L)
+            )
+
+            if N_90 > 3 * pK:
+                regime_type = "resolution"
+                implied_resolution.append(implied_C)
+            else:
+                regime_type = "FEASIBILITY"
+
+        results.append({
+            "gamma": gamma,
+            "beta": beta,
+            "N_90": N_90,
+            "pred_C1": pred_C1,
+            "implied_C": implied_C,
+            "regime": regime_type,
+        })
+
+        print(
+            f"{gamma:>5.2f} | "
+            f"{beta:>5.3f} | "
+            f"{N_90 if N_90 is not None else -1:>6d} | "
+            f"{pred_C1:>9.0f} | "
+            f"{implied_C:>9.3f} | "
+            f"{regime_type}"
+        )
+
+    if implied_resolution:
+        C_budget = float(
+            np.mean(implied_resolution)
+        )
+        cov_budget = coefficient_of_variation(
+            implied_resolution
+        )
+    else:
+        C_budget = float("nan")
+        cov_budget = float("nan")
+
+    print("\n=== Budget calibration ===")
+    print(f"C_budget = {C_budget:.3f}")
+    print(f"CoV      = {cov_budget:.3f}")
+
+    if np.isfinite(cov_budget):
+        print(
+            "Verdict  =",
+            "PASS" if cov_budget < 0.30 else "CHECK",
+        )
+    else:
+        print("Verdict  = NO RESOLUTION ROWS")
+
+    return C_budget, cov_budget, results
