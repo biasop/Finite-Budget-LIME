@@ -853,3 +853,98 @@ def backward_budget(
         print("Verdict  = NO RESOLUTION ROWS")
 
     return C_budget, cov_budget, results
+
+def sweep_d_stability(
+    d_grid=(15, 24, 30, 49),
+    n_active=4,
+):
+    import io
+    import contextlib
+
+    rows = []
+
+    print("\n=== Stability across d ===")
+    print(
+        "   d |  pK |   C_m | C_budget | C_est"
+    )
+    print("-" * 42)
+
+    for d in d_grid:
+        pK = d + 1  # K=1, gồm intercept
+
+        # Hai hàm này in rất nhiều dòng; chỉ hiện bảng tổng hợp.
+        with contextlib.redirect_stdout(io.StringIO()):
+            C_m_d, _ = calibrate_leakage(
+                d=d,
+                n_active=n_active,
+                n_trials=40,
+            )
+
+            C_budget_d, _, _ = backward_budget(
+                d=d,
+                n_active=n_active,
+                sigma_obs=1.0,
+                n_trials=30,
+            )
+
+        # C_est được đo từ một thiết kế cụ thể.
+        N_rep = max(6 * pK, 2000)
+        rng = np.random.default_rng(2027 + d)
+        Z = sample_masks(N_rep, d, rng)
+        C_est_d = realized_cest(Z, K=1)
+
+        rows.append({
+            "d": d,
+            "pK": pK,
+            "C_m": C_m_d,
+            "C_budget": C_budget_d,
+            "C_est": C_est_d,
+        })
+
+        print(
+            f"{d:>4d} | "
+            f"{pK:>3d} | "
+            f"{C_m_d:>5.3f} | "
+            f"{C_budget_d:>8.3f} | "
+            f"{C_est_d:>5.3f}"
+        )
+
+    def mean_and_cov(values):
+        values = np.asarray(values, dtype=float)
+
+        mean = float(np.mean(values))
+        cov = float(
+            np.std(values, ddof=1) / abs(mean)
+        )
+
+        return mean, cov
+
+    C_m_mean, C_m_cov = mean_and_cov(
+        [row["C_m"] for row in rows]
+    )
+
+    C_budget_mean, C_budget_cov = mean_and_cov(
+        [row["C_budget"] for row in rows]
+    )
+
+    C_est_mean, C_est_cov = mean_and_cov(
+        [row["C_est"] for row in rows]
+    )
+
+    print("\n=== Cross-d summary ===")
+    print(
+        f"C_m:      mean={C_m_mean:.3f}, "
+        f"CoV={C_m_cov:.3f}, "
+        f"{'STABLE' if C_m_cov < 0.10 else 'DRIFTS'}"
+    )
+    print(
+        f"C_budget: mean={C_budget_mean:.3f}, "
+        f"CoV={C_budget_cov:.3f}, "
+        f"{'STABLE' if C_budget_cov < 0.15 else 'DRIFTS'}"
+    )
+    print(
+        f"C_est:    mean={C_est_mean:.3f}, "
+        f"CoV={C_est_cov:.3f}"
+    )
+
+    return rows, C_m_mean, C_budget_mean
