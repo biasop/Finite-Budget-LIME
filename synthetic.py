@@ -948,3 +948,100 @@ def sweep_d_stability(
     )
 
     return rows, C_m_mean, C_budget_mean
+
+from my_core import p_K, op_inf_norm
+
+def cest_at(d, K, N, n_trials = 20, seed0 = 0):
+    gammas = []
+    c_invs = []
+    c_ests = []
+
+    pK = p_K(d, K)
+
+    for trial in range(n_trials):
+        rng = np.random.default_rng(
+            seed0 + 1009 * trial + 7 * N + d + K
+        )
+
+        Z = sample_masks(N, d, rng)
+        X = design_matrix(Z, K, intercept=True)
+        G = (X.T @ X) / N
+
+        condition = np.linalg.cond(G)
+
+        if not np.isfinite(condition) or condition > 1e8:
+            continue
+
+        gamma = float(np.linalg.eigvalsh(G)[0])
+        if gamma <= 0:
+            continue
+
+        G_inv = np.linalg.inv(G)
+        c_inv = op_inf_norm(G_inv)
+        c_est = max(gamma ** -0.5, c_inv)
+
+        gammas.append(gamma)
+        c_invs.append(c_inv)
+        c_ests.append(c_est)
+
+    if not c_ests:
+        return {
+            "d": d,
+            "K": K,
+            "N": N,
+            "pK": pK,
+            "ratio": pK / N,
+            "gamma": float("nan"),
+            "Cinv": float("nan"),
+            "Cest": float("nan"),
+            "well_posed": 0,
+            "n_trials": n_trials,
+        }
+
+    return {
+        "d": d,
+        "K": K,
+        "N": N,
+        "pK": pK,
+        "ratio": pK / N,
+        "gamma": float(np.mean(gammas)),
+        "Cinv": float(np.mean(c_invs)),
+        "Cest": float(np.mean(c_ests)),
+        "well_posed": len(c_ests),
+        "n_trials": n_trials,
+    }
+
+def cest_mechanism(N = 4000, n_trials = 20):
+    print("\n=== C_est mechanism: fixed N ===")
+    print(
+        "   d | K |  pK |  pK/N | gamma | "
+        " Cinv |  Cest | well-posed"
+    )
+
+    results = []
+
+    for K, d_values in [
+        (1, (20, 30, 40, 49, 60, 80)),
+        (2, (10, 14, 18, 22)),
+    ]:
+        for d in d_values:
+            row = cest_at(
+                d=d,
+                K=K,
+                N=N,
+                n_trials=n_trials
+            )
+            results.append(row)
+
+            print(
+                f"{d:>4d} | "
+                f"{K:>1d} | "
+                f"{row['pK']:>3d} | "
+                f"{row['ratio']:>5.3f} | "
+                f"{row['gamma']:>5.3f} | "
+                f"{row['Cinv']:>5.3f} | "
+                f"{row['Cest']:>5.3f} | "
+                f"{row['well_posed']:>2d}/{n_trials}"
+            )
+
+    return results
