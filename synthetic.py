@@ -1045,3 +1045,88 @@ def cest_mechanism(N = 4000, n_trials = 20):
             )
 
     return results
+
+def cest_transfer(n_trials=24):
+    ratios = (0.02, 0.05, 0.10, 0.20, 0.35, 0.50)
+    designs = (
+        (30, 1),
+        (49, 1),
+        (14, 2),
+        (18, 2),
+        (22, 2),
+    )
+
+    rows = []
+
+    print("\n=== Q2: C_est at matching pK/N ===")
+    print(" d | K |  pK |     N | target | actual | C_est | well-posed")
+
+    for target_ratio in ratios:
+        for d, K in designs:
+            pK =p_K(d, K)
+            N = int(round(pK / target_ratio))
+
+            row = cest_at(
+                d=d,
+                K=K,
+                N=N,
+                n_trials=n_trials
+            )
+
+            row["target_ratio"] = target_ratio
+            rows.append(row)
+
+            print(
+                f"{d:>2d} | {K} | {pK:>3d} | "
+                f"{N:>5d} | {target_ratio:>6.2f} | "
+                f"{row['ratio']:>6.3f} | "
+                f"{row['Cest']:>5.3f} | "
+                f"{row['well_posed']:>2d}/{n_trials}"
+            )
+    print("\n=== Spread within each target ratio ===")
+    print("target | min C_est | max C_est | spread | result")
+
+    spreads = []
+
+    for target_ratio in ratios:
+        members = [
+            row for row in rows
+            if row["target_ratio"] == target_ratio
+            and row["well_posed"] > 0
+            and np.isfinite(row["Cest"])
+        ]
+
+        if len(members) < 2:
+            print(f"{target_ratio:>6.2f} | insufficient data")
+            continue
+
+        c_min = min(row["Cest"] for row in members)
+        c_max = max(row["Cest"] for row in members)
+        spread = (c_max - c_min) / c_max
+        spreads.append(spread)
+
+        result = "collapse" if spread < 0.15 else "SPLIT"
+
+        print(
+            f"{target_ratio:>6.2f} | "
+            f"{c_min:>9.3f} | "
+            f"{c_max:>9.3f} | "
+            f"{spread:>6.1%} | "
+            f"{result}"
+        )
+
+    if len(spreads) != len(ratios):
+        verdict = "INCOMPLETE"
+        max_spread = float("nan")
+    else:
+        max_spread = max(spreads)
+        verdict = (
+            "COLLAPSE"
+            if max_spread < 0.15
+            else "DOES NOT COLLAPSE"
+        )
+
+    print(f"\nMax spread: {max_spread:.1%}")
+    print(f"Verdict: {verdict}")
+
+    return rows, max_spread
